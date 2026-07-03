@@ -1,0 +1,59 @@
+{
+  "name": "tabpilot-vscode",
+  "displayName": "Tabpilot",
+  "description": "VS Code client for the Tabpilot inline completion server.",
+  "version": "0.1.0",
+  "publisher": "tabpilot",
+  "private": true,
+  "engines": {
+    "vscode": "^1.95.0"
+  },
+  "categories": [
+    "Programming Languages"
+  ],
+  "activationEvents": [
+    "onStartupFinished",
+    "onCommand:tabpilot.restartLanguageServer"
+  ],
+  "main": "./out/extension.js",
+  "contributes": {
+    "commands": [
+      {
+        "command": "tabpilot.restartLanguageServer",
+        "title": "Tabpilot: Restart Language Server"
+      }
+    ],
+    "configuration": {
+      "title": "Tabpilot",
+      "properties": {
+        "tabpilot.serverPath": {
+          "type": "string",
+          "default": "",
+          "description": "Absolute path to tabpilot-lsp. When empty, the extension uses ../target/debug/tabpilot-lsp relative to the extension folder."
+        },
+        "tabpilot.trace.server": {
+          "type": "string",
+          "enum": [
+            "off",
+            "messages",
+            "verbose"
+          ],
+          "default": "off",
+          "description": "Trace communication with the Tabpilot language server."
+        }
+      }
+    }
+  },
+  "scripts": {
+    "compile": "tsc -p ./",
+    "watch": "tsc -watch -p ./"
+  },
+  "dependencies": {
+    "vscode-languageclient": "^10.1.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "@types/vscode": "^1.95.0",
+    "typescript": "^6.0.3"
+  }
+}

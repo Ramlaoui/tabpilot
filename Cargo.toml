@@ -1,0 +1,20 @@
+[package]
+name = "tabpilot"
+version = "0.1.0"
+edition = "2024"
+
+[[bin]]
+name = "tabpilot-lsp"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1.0.103"
+async-lsp = { version = "0.2.4", features = ["tokio"] }
+async-trait = "0.1.89"
+lsp-types = { version = "0.95.0", features = ["proposed"] }
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.150"
+tokio = { version = "1.52.3", features = ["full"] }
+tower = "0.5"
+tracing = "0.1.44"
+tracing-subscriber = "0.3.23"
