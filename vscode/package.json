@@ -13,7 +13,10 @@
   ],
   "activationEvents": [
     "onStartupFinished",
-    "onCommand:tabpilot.restartLanguageServer"
+    "onCommand:tabpilot.restartLanguageServer",
+    "onCommand:tabpilot.setServerPath",
+    "onCommand:tabpilot.setCommonthreadToken",
+    "onCommand:tabpilot.toggle"
   ],
   "main": "./out/extension.js",
   "contributes": {
@@ -21,6 +24,22 @@
       {
         "command": "tabpilot.restartLanguageServer",
         "title": "Tabpilot: Restart Language Server"
+      },
+      {
+        "command": "tabpilot.setServerPath",
+        "title": "Tabpilot: Set Server Path"
+      },
+      {
+        "command": "tabpilot.setCommonthreadToken",
+        "title": "Tabpilot: Set Commonthread Token"
+      },
+      {
+        "command": "tabpilot.toggle",
+        "title": "Tabpilot: Toggle Inline Completions"
+      },
+      {
+        "command": "tabpilot.showStatus",
+        "title": "Tabpilot: Show Status"
       }
     ],
     "configuration": {
@@ -30,6 +49,55 @@
           "type": "string",
           "default": "",
           "description": "Absolute path to tabpilot-lsp. When empty, the extension uses ../target/debug/tabpilot-lsp relative to the extension folder."
+        },
+        "tabpilot.provider": {
+          "type": "string",
+          "enum": [
+            "codex",
+            "claude",
+            "commonthread"
+          ],
+          "default": "commonthread",
+          "description": "Model Provider used by the Completion Server (TABPILOT_PROVIDER)."
+        },
+        "tabpilot.harness": {
+          "type": "string",
+          "enum": [
+            "claude",
+            "codex"
+          ],
+          "default": "claude",
+          "description": "Coding agent the commonthread provider uses (TABPILOT_HARNESS); its default profile and a fast model are chosen automatically."
+        },
+        "tabpilot.claude.model": {
+          "type": "string",
+          "default": "",
+          "description": "Claude model (TABPILOT_CLAUDE_MODEL). Empty uses the server default (haiku)."
+        },
+        "tabpilot.claude.effort": {
+          "type": "string",
+          "default": "",
+          "description": "Claude effort (TABPILOT_CLAUDE_EFFORT). Empty uses the server default (low)."
+        },
+        "tabpilot.commonthread.url": {
+          "type": "string",
+          "default": "",
+          "description": "Shared Commonthread server URL (TABPILOT_COMMONTHREAD_URL); needs a token from \"Tabpilot: Set Commonthread Token\". Empty uses http://127.0.0.1:8080 when a token is set or ~/.config/commonthread/tabpilot.token exists. Without a running shared server, tabpilot starts its own."
+        },
+        "tabpilot.commonthread.profile": {
+          "type": "string",
+          "default": "",
+          "description": "Commonthread profile ID (TABPILOT_COMMONTHREAD_PROFILE). Empty uses the harness's default profile."
+        },
+        "tabpilot.commonthread.model": {
+          "type": "string",
+          "default": "",
+          "description": "Commonthread model (TABPILOT_COMMONTHREAD_MODEL). Empty uses haiku for Claude and gpt-6-luna for Codex."
+        },
+        "tabpilot.commonthread.effort": {
+          "type": "string",
+          "default": "",
+          "description": "Commonthread effort (TABPILOT_COMMONTHREAD_EFFORT). Empty uses low."
         },
         "tabpilot.trace.server": {
           "type": "string",

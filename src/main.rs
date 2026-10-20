@@ -21,8 +21,9 @@ async fn main() {
         async_lsp::stdio::PipeStdout::lock_tokio().expect("failed to lock stdout"),
     );
 
-    mainloop
-        .run_buffered(stdin, stdout)
-        .await
-        .expect("tabpilot-lsp main loop failed");
+    // An editor that vanishes ends the loop with an error; the agents still stop.
+    if let Err(err) = mainloop.run_buffered(stdin, stdout).await {
+        tracing::error!(%err, "tabpilot-lsp main loop failed");
+    }
+    providers::commonthread::shutdown().await;
 }
