@@ -2,7 +2,7 @@ use std::fmt;
 use std::sync::Arc;
 use std::time::Instant;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use tokio::sync::watch;
 use tracing::info;
 
@@ -79,6 +79,17 @@ impl fmt::Debug for CompletionCancellation {
     }
 }
 
+/// Cancels a request whose future is dropped before it finishes.
+struct CancelOnDrop(Option<CompletionCancellation>);
+
+impl Drop for CancelOnDrop {
+    fn drop(&mut self) {
+        if let Some(cancellation) = &self.0 {
+            cancellation.cancel();
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct CompletionEngine {
     context: ContextEngine,
@@ -93,7 +104,30 @@ impl CompletionEngine {
         }
     }
 
+    /// The LSP drops a request's future on `$/cancelRequest`. The provider runs
+    /// in its own task instead and sees a cancellation, so it can wind down an
+    /// agent turn rather than stop between two calls to the agent.
     pub async fn complete(
+        &self,
+        completion_id: u64,
+        document: DocumentSnapshot,
+        position: CursorPosition,
+        workspace: WorkspaceContext,
+        cancellation: CompletionCancellation,
+    ) -> Result<Vec<CompletionCandidate>> {
+        let mut guard = CancelOnDrop(Some(cancellation.clone()));
+        let engine = self.clone();
+        let task = tokio::spawn(async move {
+            engine
+                .run(completion_id, document, position, workspace, cancellation)
+                .await
+        });
+        let result = task.await.context("completion task failed")?;
+        guard.0 = None;
+        result
+    }
+
+    async fn run(
         &self,
         completion_id: u64,
         document: DocumentSnapshot,
@@ -152,5 +186,64 @@ impl CompletionEngine {
 
     pub async fn cancel(&self, completion_id: u64) -> Result<()> {
         self.provider.cancel(completion_id).await
+    }
+
+    pub fn prepare(&self, workspace: &WorkspaceContext) {
+        self.provider.prepare(workspace);
+    }
+
+    pub fn status(&self) -> serde_json::Value {
+        self.provider.status()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use async_trait::async_trait;
+    use tokio::sync::oneshot;
+
+    use super::*;
+
+    /// Waits for its cancellation, then reports that it saw it.
+    struct WaitsForCancel(std::sync::Mutex<Option<oneshot::Sender<()>>>);
+
+    #[async_trait]
+    impl CompletionProvider for WaitsForCancel {
+        async fn complete(&self, request: CompletionRequest) -> Result<Vec<CompletionCandidate>> {
+            request.cancellation.cancelled().await;
+            if let Some(saw) = self.0.lock().unwrap().take() {
+                let _ = saw.send(());
+            }
+            Ok(Vec::new())
+        }
+    }
+
+    #[tokio::test]
+    async fn dropped_requests_cancel_a_provider_that_keeps_running() {
+        let (saw, seen) = oneshot::channel();
+        let engine = CompletionEngine::new(Arc::new(WaitsForCancel(Some(saw).into())));
+        let document = DocumentSnapshot {
+            uri: "file:///tmp/a.rs".to_owned(),
+            language_id: "rust".to_owned(),
+            version: 1,
+            text: "fn main() {}".to_owned(),
+        };
+        let request = engine.complete(
+            1,
+            document,
+            CursorPosition::new(0, 2),
+            WorkspaceContext::default(),
+            CompletionCancellation::new(),
+        );
+        // `$/cancelRequest` drops the request's future like this timeout does.
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(50), request)
+                .await
+                .is_err()
+        );
+        tokio::time::timeout(std::time::Duration::from_secs(1), seen)
+            .await
+            .expect("provider saw the cancellation")
+            .unwrap();
     }
 }

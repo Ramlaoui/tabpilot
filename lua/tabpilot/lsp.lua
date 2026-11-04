@@ -3,6 +3,7 @@ local M = {}
 local providers = {
 	codex = true,
 	claude = true,
+	commonthread = true,
 }
 
 local config = {}
@@ -22,8 +23,18 @@ local function plugin_root()
 	return vim.fs.dirname(vim.fs.dirname(vim.fs.dirname(source)))
 end
 
+-- The most recently built binary, so `cargo build --release` installs and a
+-- development `cargo build` both take effect.
 local function binary_path()
-	return plugin_root() .. "/target/debug/tabpilot-lsp"
+	local newest, newest_time = plugin_root() .. "/target/debug/tabpilot-lsp", -1
+	for _, profile in ipairs({ "debug", "release" }) do
+		local path = ("%s/target/%s/tabpilot-lsp"):format(plugin_root(), profile)
+		local stat = vim.uv.fs_stat(path)
+		if stat and stat.mtime.sec > newest_time then
+			newest, newest_time = path, stat.mtime.sec
+		end
+	end
+	return newest
 end
 
 local function command()
@@ -31,7 +42,7 @@ local function command()
 end
 
 local function provider()
-	local configured = config.provider or vim.g.tabpilot_provider or vim.env.TABPILOT_PROVIDER or "codex"
+	local configured = config.provider or vim.g.tabpilot_provider or vim.env.TABPILOT_PROVIDER or "commonthread"
 	return tostring(configured):lower()
 end
 
@@ -48,6 +59,7 @@ local function command_env(opts)
 	opts = opts or {}
 	local env = vim.tbl_extend("force", config.cmd_env or {}, opts.cmd_env or {})
 	env.TABPILOT_PROVIDER = opts.provider or provider()
+	env.TABPILOT_HARNESS = env.TABPILOT_HARNESS or config.harness
 	return env
 end
 
@@ -247,7 +259,7 @@ function M.set_provider(next_provider)
 	next_provider = validate_provider(next_provider)
 	if not next_provider then
 		vim.notify(
-			"provider must be one of: codex, claude",
+			"provider must be one of: codex, claude, commonthread",
 			vim.log.levels.ERROR,
 			{ title = "Tabpilot" }
 		)
@@ -279,17 +291,28 @@ function M.status()
 	local binary = cmd[1]
 	local executable = vim.fn.executable(binary) == 1 and "yes" or "no"
 	local clients = vim.lsp.get_clients({ name = "tabpilot" })
+	local lines = {
+		("tabpilot-lsp: %s"):format(binary),
+		("executable: %s"):format(executable),
+		("provider: %s"):format(provider()),
+		("clients: %d"):format(#clients),
+	}
 
-	vim.notify(
-		("tabpilot-lsp: %s\nexecutable: %s\nprovider: %s\nclients: %d"):format(
-			binary,
-			executable,
-			provider(),
-			#clients
-		),
-		vim.log.levels.INFO,
-		{ title = "Tabpilot" }
-	)
+	for _, client in ipairs(clients) do
+		local response = client:request_sync("workspace/executeCommand", { command = "tabpilot.status" }, 2000)
+		local status = response and response.result
+		if status then
+			local details = type(status.details) == "table" and status.details or {}
+			details.last_error = status.last_error
+			for _, key in ipairs({ "server", "harness", "profile", "model", "effort", "spending", "error", "last_error" }) do
+				if type(details[key]) == "string" then
+					lines[#lines + 1] = ("%s: %s"):format(key:gsub("_", " "), details[key])
+				end
+			end
+		end
+	end
+
+	vim.notify(table.concat(lines, "\n"), vim.log.levels.INFO, { title = "Tabpilot" })
 end
 
 return M

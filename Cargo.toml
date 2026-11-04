@@ -11,9 +11,14 @@ path = "src/main.rs"
 anyhow = "1.0.103"
 async-lsp = { version = "0.2.4", features = ["tokio"] }
 async-trait = "0.1.89"
+# Move to `main` once Ramlaoui/commonthread#3 merges.
+commonthread-runtime = { git = "ssh://git@github.com/Ramlaoui/commonthread.git", branch = "feat/agent-api-runtime" }
+futures-util = "0.3"
 lsp-types = { version = "0.95.0", features = ["proposed"] }
+reqwest = { version = "0.13", default-features = false, features = ["json", "stream", "rustls"] }
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.150"
+tempfile = "3"
 tokio = { version = "1.52.3", features = ["full"] }
 tower = "0.5"
 tracing = "0.1.44"
