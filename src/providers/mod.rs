@@ -31,4 +31,8 @@ pub trait CompletionProvider: Send + Sync {
     fn status(&self) -> Value {
         Value::Null
     }
+
+    /// Release what the provider holds open, such as agent sessions, before the
+    /// editor disconnects.
+    async fn shutdown(&self) {}
 }

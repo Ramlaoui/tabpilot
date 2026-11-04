@@ -13,6 +13,7 @@ local auto_start_group = vim.api.nvim_create_augroup("TabpilotAutoStart", {
 local inline_trigger_group = vim.api.nvim_create_augroup("TabpilotInlineCompletion", {
 	clear = false,
 })
+local answer_namespace = vim.api.nvim_create_namespace("tabpilot_answer")
 
 local function plugin_root()
 	local source = debug.getinfo(1, "S").source
@@ -134,6 +135,68 @@ local function enable_insert_change_trigger(bufnr)
 	})
 end
 
+-- The current visual selection as 0-based byte positions, end exclusive.
+local function visual_selection(bufnr)
+	local first, last = vim.fn.getpos("v"), vim.fn.getpos(".")
+	if first[2] > last[2] or (first[2] == last[2] and first[3] > last[3]) then
+		first, last = last, first
+	end
+	local start_row, end_row = first[2] - 1, last[2] - 1
+	local end_line = vim.api.nvim_buf_get_lines(bufnr, end_row, end_row + 1, true)[1]
+	if vim.fn.mode() == "V" then
+		return start_row, 0, end_row, #end_line
+	end
+	-- The selection includes the whole character under its last position.
+	local end_col = last[3] > #end_line and #end_line or last[3] + vim.str_utf_end(end_line, last[3])
+	return start_row, math.min(first[3] - 1, #end_line), end_row, end_col
+end
+
+-- Answer the selected question on the lines below it.
+local function answer_selection(bufnr)
+	local client = vim.lsp.get_clients({ bufnr = bufnr, name = "tabpilot" })[1]
+	if not client then
+		vim.notify("Tabpilot is not running in this buffer", vim.log.levels.WARN)
+		return
+	end
+	local start_row, start_col, end_row, end_col = visual_selection(bufnr)
+	vim.api.nvim_feedkeys(vim.keycode("<Esc>"), "n", false)
+
+	-- The mark follows the question through edits made while Tabpilot answers.
+	local mark = vim.api.nvim_buf_set_extmark(bufnr, answer_namespace, start_row, start_col, {
+		end_row = end_row,
+		end_col = end_col,
+		hl_group = "Comment",
+		virt_text = { { " Tabpilot is answering…", "Comment" } },
+	})
+	local function position(row, col)
+		return { line = row, character = vim.lsp.util.character_offset(bufnr, row, col, client.offset_encoding) }
+	end
+	local location = {
+		uri = vim.uri_from_bufnr(bufnr),
+		range = { start = position(start_row, start_col), ["end"] = position(end_row, end_col) },
+	}
+
+	client:request("workspace/executeCommand", {
+		command = "tabpilot.answerSelection",
+		arguments = { location },
+	}, function(err, result)
+		if not vim.api.nvim_buf_is_valid(bufnr) then
+			return
+		end
+		local question = vim.api.nvim_buf_get_extmark_by_id(bufnr, answer_namespace, mark, { details = true })
+		vim.api.nvim_buf_del_extmark(bufnr, answer_namespace, mark)
+		local answer = result and result.text
+		if err or type(answer) ~= "string" then
+			local reason = err and err.message or "no answer"
+			vim.notify("Tabpilot could not answer: " .. reason, vim.log.levels.WARN)
+		elseif question[1] then
+			local row = question[3].end_row
+			local col = #vim.api.nvim_buf_get_lines(bufnr, row, row + 1, true)[1]
+			vim.api.nvim_buf_set_text(bufnr, row, col, row, col, vim.split(answer, "\n", { plain = true }))
+		end
+	end, bufnr)
+end
+
 local function start_buffer(bufnr)
 	if not auto_start_enabled() or not should_start_for_buffer(bufnr) then
 		return nil
@@ -234,6 +297,12 @@ function M.start(opts)
 		buffer = bufnr,
 		expr = true,
 		desc = "Accept Tabpilot inline completion",
+	})
+	vim.keymap.set("x", "<M-l>", function()
+		answer_selection(bufnr)
+	end, {
+		buffer = bufnr,
+		desc = "Answer the selected question with Tabpilot",
 	})
 
 	return client_id

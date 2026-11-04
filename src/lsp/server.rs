@@ -18,16 +18,17 @@ use lsp_types::request::{ExecuteCommand, Initialize, InlineCompletionRequest, Sh
 use lsp_types::{
     DidChangeTextDocumentParams, DidCloseTextDocumentParams, DidOpenTextDocumentParams,
     DidSaveTextDocumentParams, ExecuteCommandOptions, InitializeResult, InitializedParams,
-    InlineCompletionResponse, MessageType, OneOf, ServerCapabilities, ShowMessageParams,
+    InlineCompletionResponse, Location, MessageType, OneOf, ServerCapabilities, ShowMessageParams,
     TextDocumentSyncCapability, TextDocumentSyncKind,
 };
-use serde_json::json;
+use serde_json::{Value, json};
 use tower::ServiceBuilder;
 use tracing::{error, info, warn};
 
 use crate::completion::{CompletionCancellation, CompletionEngine};
 use crate::documents::{DocumentSnapshot, DocumentStore};
 use crate::lsp::inline_completion::from_lsp_position;
+use crate::protocol::TextRange;
 use crate::providers::CompletionProvider;
 use crate::providers::claude::ClaudeProvider;
 use crate::providers::codex::CodexProvider;
@@ -35,9 +36,11 @@ use crate::providers::commonthread::CommonthreadProvider;
 use crate::workspace::WorkspaceContext;
 
 /// How long typing must pause before a completion request reaches the provider.
-const TYPING_PAUSE: std::time::Duration = std::time::Duration::from_millis(200);
+const TYPING_PAUSE: std::time::Duration = std::time::Duration::from_millis(500);
 /// Returns the provider in use and the last completion error, for the editor's status view.
 const STATUS_COMMAND: &str = "tabpilot.status";
+/// Answers the question at a `Location`; the reply's `text` goes at the end of its last line.
+const ANSWER_COMMAND: &str = "tabpilot.answerSelection";
 
 pub struct CompletionServer {
     documents: Arc<DocumentStore>,
@@ -89,7 +92,10 @@ impl CompletionServer {
                             )),
                             inline_completion_provider: Some(OneOf::Left(true)),
                             execute_command_provider: Some(ExecuteCommandOptions {
-                                commands: vec![STATUS_COMMAND.to_owned()],
+                                commands: vec![
+                                    STATUS_COMMAND.to_owned(),
+                                    ANSWER_COMMAND.to_owned(),
+                                ],
                                 ..ExecuteCommandOptions::default()
                             }),
                             ..ServerCapabilities::default()
@@ -99,8 +105,16 @@ impl CompletionServer {
                     })
                 }
             })
-            .request::<Shutdown, _>(|_, _| async move { Ok(()) })
+            .request::<Shutdown, _>(|server, _| {
+                let completion = server.completion.clone();
+                async move {
+                    completion.shutdown().await;
+                    Ok(())
+                }
+            })
             .request::<ExecuteCommand, _>(|server, params| {
+                let answer = (params.command == ANSWER_COMMAND)
+                    .then(|| server.answer_selection(params.arguments.into_iter().next()));
                 let status = (params.command == STATUS_COMMAND).then(|| {
                     json!({
                         "provider": server.provider_name,
@@ -109,9 +123,14 @@ impl CompletionServer {
                     })
                 });
                 async move {
-                    status.map(Some).ok_or_else(|| {
-                        ResponseError::new(ErrorCode::INVALID_PARAMS, "unknown command")
-                    })
+                    match (status, answer) {
+                        (Some(status), _) => Ok(Some(status)),
+                        (_, Some(answer)) => answer.await,
+                        _ => Err(ResponseError::new(
+                            ErrorCode::INVALID_PARAMS,
+                            "unknown command",
+                        )),
+                    }
                 }
             })
             .request::<InlineCompletionRequest, _>(|server, params| {
@@ -232,6 +251,47 @@ impl CompletionServer {
         router
     }
 
+    /// Answer the question selected at `location`, replying `{"text": answer}`.
+    fn answer_selection(
+        &self,
+        location: Option<Value>,
+    ) -> impl Future<Output = Result<Option<Value>, ResponseError>> + use<> {
+        let location = location.map(serde_json::from_value::<Location>);
+        let documents = Arc::clone(&self.documents);
+        let completion = self.completion.clone();
+        let workspace = self.workspace.clone();
+        let completion_id = self.coordinator.next_id();
+
+        async move {
+            let invalid = |message: String| ResponseError::new(ErrorCode::INVALID_PARAMS, message);
+            let location = location
+                .ok_or_else(|| invalid("expected the selection's location".to_owned()))?
+                .map_err(|err| invalid(format!("invalid selection location: {err}")))?;
+            let uri = location.uri.to_string();
+            let document = documents
+                .snapshot(&uri)
+                .ok_or_else(|| invalid(format!("{uri} is not open")))?;
+            let selection = TextRange {
+                start: from_lsp_position(location.range.start),
+                end: from_lsp_position(location.range.end),
+            };
+            let answer = completion
+                .answer_selection(
+                    completion_id,
+                    document,
+                    selection,
+                    workspace,
+                    CompletionCancellation::new(),
+                )
+                .await
+                .map_err(|err| {
+                    error!(%err, "answer request failed");
+                    ResponseError::new(ErrorCode::INTERNAL_ERROR, format!("{err:#}"))
+                })?;
+            Ok(Some(json!({ "text": answer })))
+        }
+    }
+
     fn initialized(&mut self, _: InitializedParams) -> ControlFlow<async_lsp::Result<()>> {
         info!("tabpilot-lsp initialized");
         self.completion.prepare(&self.workspace);
@@ -339,8 +399,12 @@ struct ActiveCompletion {
 }
 
 impl CompletionCoordinator {
+    fn next_id(&self) -> u64 {
+        self.latest_id.fetch_add(1, Ordering::SeqCst) + 1
+    }
+
     fn begin(&self) -> CompletionPermit {
-        let id = self.latest_id.fetch_add(1, Ordering::SeqCst) + 1;
+        let id = self.next_id();
         let cancellation = CompletionCancellation::new();
         let previous = self
             .current_cancellation

@@ -2,7 +2,7 @@ use std::fmt;
 use std::sync::Arc;
 use std::time::Instant;
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use tokio::sync::watch;
 use tracing::info;
 
@@ -79,6 +79,18 @@ impl fmt::Debug for CompletionCancellation {
     }
 }
 
+/// Runs `work` in its own task: the LSP drops a request's future on
+/// `$/cancelRequest`, which then cancels the work instead of abandoning it.
+async fn detach<T: Send + 'static>(
+    cancellation: CompletionCancellation,
+    work: impl Future<Output = Result<T>> + Send + 'static,
+) -> Result<T> {
+    let mut guard = CancelOnDrop(Some(cancellation));
+    let result = tokio::spawn(work).await.context("completion task failed")?;
+    guard.0 = None;
+    result
+}
+
 /// Cancels a request whose future is dropped before it finishes.
 struct CancelOnDrop(Option<CompletionCancellation>);
 
@@ -115,16 +127,60 @@ impl CompletionEngine {
         workspace: WorkspaceContext,
         cancellation: CompletionCancellation,
     ) -> Result<Vec<CompletionCandidate>> {
-        let mut guard = CancelOnDrop(Some(cancellation.clone()));
         let engine = self.clone();
-        let task = tokio::spawn(async move {
+        detach(cancellation.clone(), async move {
             engine
                 .run(completion_id, document, position, workspace, cancellation)
                 .await
-        });
-        let result = task.await.context("completion task failed")?;
-        guard.0 = None;
-        result
+        })
+        .await
+    }
+
+    /// Answer the question selected in `document`, like a `-- question --` marker:
+    /// the answer text goes at the end of the selection's last line, starting with
+    /// a newline. `None` means the provider had no answer or was cancelled.
+    pub async fn answer_selection(
+        &self,
+        completion_id: u64,
+        document: DocumentSnapshot,
+        selection: TextRange,
+        workspace: WorkspaceContext,
+        cancellation: CompletionCancellation,
+    ) -> Result<Option<String>> {
+        let question = document
+            .text_in(selection)
+            .context("the selection is outside the document")?
+            .trim()
+            .to_owned();
+        if question.is_empty() {
+            bail!("the selection is empty");
+        }
+        let request = AnswerRequest {
+            completion_id,
+            question,
+            context: self.context.build(&document, selection.end),
+            document,
+            position: selection.end,
+            workspace,
+            cancellation: cancellation.clone(),
+        };
+        let engine = self.clone();
+        let candidates = detach(cancellation, async move { engine.answer(request).await }).await?;
+        Ok(candidates
+            .into_iter()
+            .next()
+            .map(|answer| answer.insert_text))
+    }
+
+    async fn answer(&self, request: AnswerRequest) -> Result<Vec<CompletionCandidate>> {
+        let provider_start = Instant::now();
+        let candidates = self.provider.answer(request).await?;
+        info!(
+            provider_latency_ms = provider_start.elapsed().as_millis(),
+            candidate_count = candidates.len(),
+            "provider answered inline question",
+        );
+        Ok(candidates)
     }
 
     async fn run(
@@ -141,26 +197,17 @@ impl CompletionEngine {
 
         let context = self.context.build(&document, position);
         if let Some(question) = parse_answer_command(&context) {
-            let request = AnswerRequest {
-                completion_id,
-                question,
-                document,
-                position,
-                context,
-                workspace,
-                cancellation,
-            };
-
-            let provider_start = Instant::now();
-            let candidates = self.provider.answer(request).await?;
-
-            info!(
-                provider_latency_ms = provider_start.elapsed().as_millis(),
-                candidate_count = candidates.len(),
-                "provider answered inline question",
-            );
-
-            return Ok(candidates);
+            return self
+                .answer(AnswerRequest {
+                    completion_id,
+                    question,
+                    document,
+                    position,
+                    context,
+                    workspace,
+                    cancellation,
+                })
+                .await;
         }
 
         let request = CompletionRequest {
@@ -195,6 +242,10 @@ impl CompletionEngine {
     pub fn status(&self) -> serde_json::Value {
         self.provider.status()
     }
+
+    pub async fn shutdown(&self) {
+        self.provider.shutdown().await;
+    }
 }
 
 #[cfg(test)]
@@ -216,6 +267,53 @@ mod tests {
             }
             Ok(Vec::new())
         }
+    }
+
+    /// Answers with the question it was asked.
+    struct EchoesQuestion;
+
+    #[async_trait]
+    impl CompletionProvider for EchoesQuestion {
+        async fn complete(&self, _: CompletionRequest) -> Result<Vec<CompletionCandidate>> {
+            Ok(Vec::new())
+        }
+
+        async fn answer(&self, request: AnswerRequest) -> Result<Vec<CompletionCandidate>> {
+            Ok(vec![CompletionCandidate {
+                insert_text: format!("answer to {}", request.question),
+                range: Some(TextRange::empty_at(request.position)),
+            }])
+        }
+    }
+
+    #[tokio::test]
+    async fn answers_the_selected_question() {
+        let engine = CompletionEngine::new(Arc::new(EchoesQuestion));
+        let document = DocumentSnapshot {
+            uri: "file:///tmp/notes.md".to_owned(),
+            language_id: "markdown".to_owned(),
+            version: 1,
+            text: "intro\n  why 😀?  \nend".to_owned(),
+        };
+        let answer = |start, end| {
+            engine.answer_selection(
+                1,
+                document.clone(),
+                TextRange {
+                    start: CursorPosition::new(1, start),
+                    end: CursorPosition::new(1, end),
+                },
+                WorkspaceContext::default(),
+                CompletionCancellation::new(),
+            )
+        };
+
+        let answered = answer(0, 11).await.unwrap();
+        assert_eq!(answered.as_deref(), Some("answer to why 😀?"));
+        assert!(
+            answer(0, 2).await.is_err(),
+            "a blank selection is not a question"
+        );
     }
 
     #[tokio::test]
