@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::sync::RwLock;
 
-use crate::protocol::CursorPosition;
+use crate::protocol::{CursorPosition, TextRange};
 
 #[derive(Debug, Clone)]
 pub struct DocumentSnapshot {
@@ -18,6 +18,13 @@ impl DocumentSnapshot {
             self.text[..byte_index].to_owned(),
             self.text[byte_index..].to_owned(),
         ))
+    }
+
+    /// The text a range covers, if the range lies in the document.
+    pub fn text_in(&self, range: TextRange) -> Option<&str> {
+        let start = self.byte_index_for_position(range.start)?;
+        let end = self.byte_index_for_position(range.end)?;
+        self.text.get(start..end)
     }
 
     fn byte_index_for_position(&self, position: CursorPosition) -> Option<usize> {
@@ -127,6 +134,23 @@ mod tests {
 
         assert_eq!(prefix, "fn");
         assert_eq!(suffix, " main() {\n}");
+    }
+
+    #[test]
+    fn reads_text_in_a_range_across_lines_and_utf16_columns() {
+        let snapshot = DocumentSnapshot {
+            uri: "file:///tmp/test.txt".to_owned(),
+            language_id: "text".to_owned(),
+            version: 1,
+            text: "ab\ncd😀e".to_owned(),
+        };
+        let range = |start, end| TextRange {
+            start: CursorPosition::new(0, start),
+            end: CursorPosition::new(1, end),
+        };
+
+        assert_eq!(snapshot.text_in(range(1, 4)), Some("b\ncd😀"));
+        assert_eq!(snapshot.text_in(range(0, 0)), Some("ab\n"));
     }
 
     #[test]

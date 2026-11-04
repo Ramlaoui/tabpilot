@@ -182,12 +182,15 @@ impl CommonthreadApi {
     /// Close an idle session's worker in the background; history stays on the server.
     pub(super) fn close(&self, session_id: String) {
         let api = self.clone();
-        tokio::spawn(async move {
-            let path = format!("/v1/sessions/{session_id}/close");
-            if let Err(err) = api.post(&path, None).await {
-                info!(session = session_id, error = %format!("{err:#}"), "session close skipped");
-            }
-        });
+        tokio::spawn(async move { api.close_now(&session_id).await });
+    }
+
+    /// Close an idle session's worker once the server accepts the request.
+    pub(super) async fn close_now(&self, session_id: &str) {
+        let path = format!("/v1/sessions/{session_id}/close");
+        if let Err(err) = self.post(&path, None).await {
+            info!(session = session_id, error = %format!("{err:#}"), "session close skipped");
+        }
     }
 
     /// Stream session events after `after` until the server closes the stream.

@@ -27,12 +27,16 @@ use self::config::{CommonthreadProviderConfig, MAX_SESSION_PROMPT_CHARS, default
 
 pub use self::api::shutdown;
 
-const SESSION_INSTRUCTIONS: &str = "You serve editor inline completions for this repository. \
+const COMPLETION_INSTRUCTIONS: &str = "You serve editor inline completions for this repository. \
 The first message asks you to learn the repository with a few quick read-only lookups. Every \
 later message is a completion request: answer it immediately from that message and what you \
 already learned, without using any tools. Never edit files. Judge each request on its own: \
 earlier answers, including empty ones, say nothing about the next. Suggest text whenever the \
 file could plausibly continue at the cursor.";
+const QUESTION_INSTRUCTIONS: &str = "You answer questions asked from an editor in this \
+repository. Each message carries one question with the editor context around it; earlier \
+questions and answers in this conversation can give it context. Answer immediately, without \
+using any tools. Never edit files.";
 const WARM_UP: &str = "Get familiar with this repository so later completions match its code: \
 look at its layout, README, and main modules with a few quick read-only lookups (list, search, \
 read). This message is not a completion request. Reply with one suggestion whose insert_text \
@@ -69,6 +73,8 @@ struct Client {
     api: CommonthreadApi,
     profile: OnceCell<Profile>,
     completion: Arc<Mutex<Option<Session>>>,
+    /// The session this editor's questions share, so follow-ups see earlier answers.
+    questions: Arc<Mutex<Option<Session>>>,
     spare: std::sync::Mutex<Option<Spare>>,
     spent: Arc<std::sync::Mutex<Spent>>,
 }
@@ -155,11 +161,7 @@ impl CompletionProvider for CommonthreadProvider {
             _ = request.cancellation.cancelled() => return Ok(Vec::new()),
         };
         let cwd = workspace_cwd(&request.workspace).context(NO_WORKSPACE)?;
-        if let Some(reason) = slot.as_ref().and_then(|s| s.rotation_reason(&cwd)) {
-            let old = slot.take().expect("checked above");
-            info!(session = old.id, reason, "rotating commonthread session");
-            client.api.close(old.id);
-        }
+        client.rotate(&mut slot, &cwd);
         if slot.is_none() {
             match client
                 .completion_session(&cwd, &request.cancellation)
@@ -209,20 +211,21 @@ impl CompletionProvider for CommonthreadProvider {
 
     async fn answer(&self, request: AnswerRequest) -> Result<Vec<CompletionCandidate>> {
         let client = self.client()?;
-        if request.cancellation.is_cancelled() {
-            return Ok(Vec::new());
+        let mut slot = tokio::select! {
+            slot = client.questions.clone().lock_owned() => slot,
+            _ = request.cancellation.cancelled() => return Ok(Vec::new()),
+        };
+        let cwd = workspace_cwd(&request.workspace).context(NO_WORKSPACE)?;
+        client.rotate(&mut slot, &cwd);
+        if slot.is_none() {
+            *slot = Some(client.create(&cwd, QUESTION_INSTRUCTIONS, None).await?);
         }
         let prompt = decorate_answer_prompt(&answer_context_to_text(&request), &request.question);
-        let cwd = workspace_cwd(&request.workspace).context(NO_WORKSPACE)?;
-        let session = client.create(&cwd, None).await?;
-        let id = session.id.clone();
-        let slot = Arc::new(Mutex::new(Some(session))).lock_owned().await;
         let timeout = client.config.turn_timeout;
-        let result = client
+        let Some(result) = client
             .run_turn(slot, &prompt, &request.cancellation, timeout)
-            .await;
-        client.api.close(id);
-        let Some(result) = result? else {
+            .await?
+        else {
             return Ok(Vec::new());
         };
         let response = result["text"].as_str().unwrap_or_default();
@@ -232,6 +235,12 @@ impl CompletionProvider for CommonthreadProvider {
     fn prepare(&self, workspace: &WorkspaceContext) {
         if let (Ok(client), Some(cwd)) = (&self.client, workspace_cwd(workspace)) {
             client.warm_spare(&cwd);
+        }
+    }
+
+    async fn shutdown(&self) {
+        if let Ok(client) = &self.client {
+            client.close_sessions().await;
         }
     }
 
@@ -275,6 +284,7 @@ impl Client {
             config,
             profile: OnceCell::new(),
             completion: Arc::new(Mutex::new(None)),
+            questions: Arc::new(Mutex::new(None)),
             spare: std::sync::Mutex::new(None),
             spent: Arc::default(),
         })
@@ -309,9 +319,46 @@ impl Client {
                 }
             }
         }
-        self.create(cwd, Some(completion_output_schema()))
-            .await
-            .map(Some)
+        self.create(
+            cwd,
+            COMPLETION_INSTRUCTIONS,
+            Some(completion_output_schema()),
+        )
+        .await
+        .map(Some)
+    }
+
+    /// Close this editor's completion and question sessions so their workers stop
+    /// now rather than at the server's idle timeout. A session busy with a turn or
+    /// still warming is left to that timeout.
+    async fn close_sessions(&self) {
+        let spare = self.spare.lock().expect("spare lock").take();
+        let warmed = match spare {
+            Some(spare) if spare.task.is_finished() => spare.task.await.ok().and_then(Result::ok),
+            Some(spare) => {
+                spare.task.abort();
+                None
+            }
+            None => None,
+        };
+        let idle = |slot: &Mutex<Option<Session>>| slot.try_lock().ok().and_then(|mut s| s.take());
+        let current = [idle(&self.completion), idle(&self.questions)];
+        for session in warmed.into_iter().chain(current.into_iter().flatten()) {
+            self.api.close_now(&session.id).await;
+            info!(
+                session = session.id,
+                "closed commonthread session on shutdown"
+            );
+        }
+    }
+
+    /// Close the session in `slot` if it should not take another turn in `cwd`.
+    fn rotate(&self, slot: &mut Option<Session>, cwd: &str) {
+        if let Some(reason) = slot.as_ref().and_then(|s| s.rotation_reason(cwd)) {
+            let old = slot.take().expect("checked above");
+            info!(session = old.id, reason, "rotating commonthread session");
+            self.api.close(old.id);
+        }
     }
 
     fn warm_spare(self: &Arc<Self>, cwd: &str) {
@@ -329,7 +376,13 @@ impl Client {
 
     /// Create a completion session and let it read the repository once.
     async fn warm_up(&self, cwd: &str) -> Result<Session> {
-        let session = self.create(cwd, Some(completion_output_schema())).await?;
+        let session = self
+            .create(
+                cwd,
+                COMPLETION_INSTRUCTIONS,
+                Some(completion_output_schema()),
+            )
+            .await?;
         let id = session.id.clone();
         let slot = Arc::new(Mutex::new(Some(session)));
         let guard = Arc::clone(&slot).lock_owned().await;
@@ -374,7 +427,12 @@ impl Client {
         )
     }
 
-    async fn create(&self, cwd: &str, output_schema: Option<Value>) -> Result<Session> {
+    async fn create(
+        &self,
+        cwd: &str,
+        instructions: &str,
+        output_schema: Option<Value>,
+    ) -> Result<Session> {
         let profile = self.profile().await?;
         let (model, effort) = self.agent(profile);
         let body = json!({
@@ -383,7 +441,7 @@ impl Client {
             "agent": {
                 "model": model,
                 "effort": effort,
-                "instructions": SESSION_INSTRUCTIONS,
+                "instructions": instructions,
                 "output_schema": output_schema,
             },
         });

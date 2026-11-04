@@ -74,9 +74,12 @@ Use only this active-document context. Return only the JSON suggestions object.
 
 const ANSWER_PROMPT: &str = r#"Answer this editor question directly.
 
-Return only the answer text that should be inserted below the question marker.
-Be concise. Prefer code when the question asks how to write code.
-Do not include Markdown fences.
+Your reply goes into the document verbatim on the lines after the question, so
+write only text that belongs in this file:
+- In a source file, reply with code. Put any short explanation in that language's
+  comment syntax.
+- In prose, reply with plain prose.
+Be concise. Use Markdown fences or backticks only when the document is Markdown.
 "#;
 
 pub(in crate::providers) fn decorate_completion_prompt(
